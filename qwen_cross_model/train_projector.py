@@ -27,7 +27,7 @@ from qwen_cross_model.config import (
     PROMPT_LEN, PROMPT_LR, PROMPT_EPOCHS, PROMPT_BATCH_SIZE,
     PROMPT_ANCHOR_WEIGHT, SUPERPOS_M, NUM_LABELS,
     PROJECTOR_LR, PROJECTOR_EPOCHS, PROJECTOR_BATCH_SIZE,
-    OUTPUT_DIR,
+    OUTPUT_DIR, DEFAULT_SEED,
 )
 from qwen_cross_model.prompt_tuner import train_prompt, train_superpos_prompt
 from qwen_cross_model.projector import train_projector
@@ -35,6 +35,7 @@ from qwen_cross_model.utils import (
     load_prompt, evaluate_model, build_dataloader, load_dataset_by_name,
     PromptQwenWrapper, SuperPosPromptWrapper,
     save_superpos_prompt, load_superpos_prompt, transfer_superpos,
+    set_seed,
 )
 from qwen_cross_model.eval import quick_compare
 
@@ -76,8 +77,12 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1, help="Set by torchrun for DDP")
     parser.add_argument("--save-name", type=str, default=None, help="Custom checkpoint filename")
     parser.add_argument("--device", type=str, default=None, help="cuda / cpu")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                        help="Random seed used for reproducible prompt training")
 
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     # DDP mode: launched by torchrun
     is_ddp = args.local_rank >= 0 or "LOCAL_RANK" in os.environ
@@ -112,6 +117,7 @@ def main():
                 num_gpus=num_gpus,
                 resume_from=args.resume_prompt,
                 save_name=args.save_name,
+                seed=args.seed,
             )
             src_prompt_path = metrics["save_path"]
 

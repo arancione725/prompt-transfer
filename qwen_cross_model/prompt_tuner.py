@@ -15,6 +15,7 @@ from .config import (
     PROMPT_LR, PROMPT_EPOCHS, PROMPT_BATCH_SIZE,
     PROMPT_WARMUP_RATIO, PROMPT_WEIGHT_DECAY, PROMPT_ANCHOR_WEIGHT,
     PROMPT_INIT_TEXT, NUM_LABELS, OUTPUT_DIR,
+    SUPERPOS_TEMPERATURE, DEFAULT_SEED,
 )
 from .utils import (
     PromptQwenWrapper,
@@ -26,6 +27,7 @@ from .utils import (
     train_one_epoch,
     evaluate_model,
     build_dataloader,
+    set_seed,
 )
 
 
@@ -53,7 +55,9 @@ def train_prompt(
     device=None,
     num_gpus=0,
     resume_from=None,
+    seed=DEFAULT_SEED,
 ):
+    set_seed(seed)
     # ---- DDP setup ----
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if local_rank >= 0:
@@ -103,7 +107,7 @@ def train_prompt(
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True)
         train_loader = build_dataloader(train_ds, batch_size, shuffle=False, sampler=train_sampler)
     else:
-        train_loader = build_dataloader(train_ds, batch_size, shuffle=True)
+        train_loader = build_dataloader(train_ds, batch_size, shuffle=True, seed=seed)
 
     eval_loader = build_dataloader(eval_ds, batch_size * 2, shuffle=False)
     train_eval_subset = torch.utils.data.Subset(train_ds, range(min(1000, len(train_ds))))
@@ -202,6 +206,7 @@ def train_superpos_prompt(
     num_gpus=0,
     resume_from=None,
     save_name=None,
+    seed=DEFAULT_SEED,
 ):
     """Train SuperPos soft prompt: each prompt vector = weighted sum of m token embeddings.
 
@@ -210,6 +215,8 @@ def train_superpos_prompt(
     """
     import os
     from .utils import SuperPosPromptWrapper, save_superpos_prompt, train_one_epoch
+
+    set_seed(seed)
 
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if local_rank >= 0:
@@ -240,7 +247,14 @@ def train_superpos_prompt(
     ckpt_path = os.path.join(output_dir, f"superpos_checkpoint.pt")
 
     # Build SuperPos wrapper
-    wrapper = SuperPosPromptWrapper(model_name, prompt_len=prompt_len, num_labels=NUM_LABELS, m=m)
+    wrapper = SuperPosPromptWrapper(
+        model_name,
+        prompt_len=prompt_len,
+        num_labels=NUM_LABELS,
+        m=m,
+        temperature=SUPERPOS_TEMPERATURE,
+        seed=seed,
+    )
     wrapper.to(device)
     _raw = wrapper
 
@@ -255,7 +269,7 @@ def train_superpos_prompt(
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True)
         train_loader = build_dataloader(train_ds, batch_size, shuffle=False, sampler=train_sampler)
     else:
-        train_loader = build_dataloader(train_ds, batch_size, shuffle=True)
+        train_loader = build_dataloader(train_ds, batch_size, shuffle=True, seed=seed)
     eval_loader = build_dataloader(eval_ds, batch_size * 2, shuffle=False)
     train_eval_subset = torch.utils.data.Subset(train_ds, range(min(1000, len(train_ds))))
     train_eval_loader = build_dataloader(train_eval_subset, batch_size * 2, shuffle=False)

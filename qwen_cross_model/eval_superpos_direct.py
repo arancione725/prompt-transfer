@@ -16,12 +16,18 @@ if _PARENT not in sys.path:
 
 import argparse
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from qwen_cross_model.config import SUPERPOS_TEMPERATURE
-from qwen_cross_model.utils import load_dataset_by_name, build_dataloader
+from qwen_cross_model.config import DEFAULT_SEED
+from qwen_cross_model.utils import (
+    load_dataset_by_name,
+    build_dataloader,
+    activate_superpos_weights,
+    assert_sampled_ids_aligned,
+    get_verbalizer_ids,
+    set_seed,
+)
 
 
 def main():
@@ -36,7 +42,10 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--pos-word", default="positive", help="Word used for positive class")
     parser.add_argument("--neg-word", default="negative", help="Word used for negative class")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     print(f"SuperPos + LM Head Evaluation (direct bridge)")
     print(f"Source prompt: {args.src_prompt}")
@@ -48,8 +57,11 @@ def main():
     print("\n[1/5] Loading SuperPos checkpoint...")
     ckpt = torch.load(args.src_prompt, map_location="cpu")
     sampled_ids = ckpt["sampled_ids"]            # [128]
-    logits = ckpt["prompt_weights"].float()      # [100, 128]
-    prob = F.softmax(logits / SUPERPOS_TEMPERATURE, dim=-1)
+    prob, temperature = activate_superpos_weights(ckpt)
+    sampled_ids = sampled_ids.long()
+    if not 1 <= args.bridge_k <= prob.size(1):
+        raise ValueError(f"--bridge-k must be in [1, {prob.size(1)}], got {args.bridge_k}")
+    print(f"  Checkpoint temperature: {temperature}")
 
     # --- 2. Direct bridge: same sampled_ids → target embedding lookup ---
     print("[2/5] Direct bridge: same token IDs, target embedding lookup...")
@@ -57,6 +69,7 @@ def main():
         args.tgt_model, torch_dtype=torch.float16, device_map=args.device
     )
     tgt_model.eval()
+    src_tokenizer = AutoTokenizer.from_pretrained(args.src_model)
     tgt_emb = tgt_model.model.embed_tokens.weight[sampled_ids].float().cpu()  # [128, 3584]
 
     if args.bridge_k < prob.size(1):
@@ -77,15 +90,10 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    assert_sampled_ids_aligned(sampled_ids, src_tokenizer, tokenizer)
 
-    pos_ids = set()
-    neg_ids = set()
-    for prefix in ["", " "]:
-        pos_ids.update(tokenizer.encode(prefix + args.pos_word, add_special_tokens=False))
-        neg_ids.update(tokenizer.encode(prefix + args.neg_word, add_special_tokens=False))
-
-    pos_ids = sorted(pos_ids)
-    neg_ids = sorted(neg_ids)
+    pos_ids = get_verbalizer_ids(tokenizer, args.pos_word)
+    neg_ids = get_verbalizer_ids(tokenizer, args.neg_word)
     print(f"  Positive tokens: {pos_ids}  → {[tokenizer.decode([i]) for i in pos_ids]}")
     print(f"  Negative tokens: {neg_ids}  → {[tokenizer.decode([i]) for i in neg_ids]}")
 

@@ -1,6 +1,9 @@
 """Utilities for Qwen prompt tuning: model wrapper, data loading, prompt manipulation."""
 
+import os
+import random
 import time
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +16,114 @@ from .config import (
     MAX_SEQ_LENGTH, NUM_LABELS, PROMPT_LEN,
     PROMPT_INIT_TOKEN, SUPERPOS_TEMPERATURE,
 )
+
+
+def set_seed(seed, deterministic=True):
+    """Seed every RNG used by the training and evaluation pipeline."""
+    if seed is None:
+        return
+
+    seed = int(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def resolve_superpos_temperature(checkpoint, fallback=SUPERPOS_TEMPERATURE):
+    """Read the training temperature from a checkpoint.
+
+    Older checkpoints do not contain this metadata, so they fall back to the
+    current config value with an explicit warning.
+    """
+    temperature = checkpoint.get("temperature")
+    if temperature is None:
+        warnings.warn(
+            "SuperPos checkpoint has no saved temperature; falling back to "
+            f"config value {fallback}. Re-save the checkpoint after retraining "
+            "for exact reproducibility.",
+            RuntimeWarning,
+        )
+        temperature = fallback
+
+    temperature = float(temperature)
+    if temperature <= 0:
+        raise ValueError(f"SuperPos temperature must be positive, got {temperature}")
+    return temperature
+
+
+def activate_superpos_weights(checkpoint, temperature=None):
+    """Activate a softmax SuperPos checkpoint using its recorded temperature."""
+    if checkpoint.get("weight_mode", "softmax") != "softmax":
+        raise ValueError(
+            "Expected a softmax SuperPos checkpoint, got "
+            f"weight_mode={checkpoint.get('weight_mode')!r}"
+        )
+
+    raw_weights = checkpoint["prompt_weights"].float()
+    sampled_ids = checkpoint["sampled_ids"].long()
+    if raw_weights.ndim != 2 or sampled_ids.ndim != 1:
+        raise ValueError("SuperPos checkpoint has invalid prompt_weights/sampled_ids shapes")
+    if raw_weights.size(1) != sampled_ids.numel():
+        raise ValueError(
+            "SuperPos checkpoint mismatch: prompt_weights has "
+            f"{raw_weights.size(1)} basis columns but sampled_ids has "
+            f"{sampled_ids.numel()} IDs"
+        )
+
+    actual_temperature = (
+        resolve_superpos_temperature(checkpoint)
+        if temperature is None
+        else float(temperature)
+    )
+    if actual_temperature <= 0:
+        raise ValueError(f"SuperPos temperature must be positive, got {actual_temperature}")
+    return F.softmax(raw_weights / actual_temperature, dim=-1), actual_temperature
+
+
+def assert_sampled_ids_aligned(sampled_ids, src_tokenizer, tgt_tokenizer):
+    """Ensure direct transfer really refers to the same tokens on both models."""
+    sampled_ids = sampled_ids.long().flatten()
+    src_vocab_size = len(src_tokenizer)
+    tgt_vocab_size = len(tgt_tokenizer)
+    mismatches = []
+
+    for token_id in sampled_ids.tolist():
+        if token_id < 0 or token_id >= src_vocab_size or token_id >= tgt_vocab_size:
+            mismatches.append((token_id, "out_of_range"))
+            continue
+        src_token = src_tokenizer.convert_ids_to_tokens(token_id)
+        tgt_token = tgt_tokenizer.convert_ids_to_tokens(token_id)
+        if src_token != tgt_token:
+            mismatches.append((token_id, src_token, tgt_token))
+
+    if mismatches:
+        sample = "; ".join(map(str, mismatches[:5]))
+        raise ValueError(
+            "Direct SuperPos transfer requires aligned token IDs, but source "
+            f"and target tokenizers differ (examples: {sample}). Use an explicit "
+            "token-text alignment bridge instead."
+        )
+
+
+def get_verbalizer_ids(tokenizer, word):
+    """Return IDs for the two common word-boundary forms of a single token."""
+    ids = set()
+    for prefix in ["", " "]:
+        encoded = tokenizer.encode(prefix + word, add_special_tokens=False)
+        if len(encoded) != 1:
+            raise ValueError(
+                f"Verbalizer {prefix + word!r} must tokenize to exactly one token; "
+                f"got IDs {encoded}. Use a sequence-aware scorer for multi-token labels."
+            )
+        ids.add(encoded[0])
+    return sorted(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +297,15 @@ class SuperPosPromptWrapper(nn.Module):
         sampled_ids: optional pre-existing token IDs for loading/transfer
     """
 
-    def __init__(self, model_name, prompt_len=PROMPT_LEN, num_labels=NUM_LABELS, m=128, sampled_ids=None):
+    def __init__(self, model_name, prompt_len=PROMPT_LEN, num_labels=NUM_LABELS,
+                 m=128, sampled_ids=None, temperature=SUPERPOS_TEMPERATURE,
+                 seed=None):
         super().__init__()
+        self.model_name = model_name
         self.prompt_len = prompt_len
         self.m = m
+        self.temperature = float(temperature)
+        self.seed = seed
         self.hidden_size = None
 
         self.backbone = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -251,14 +367,8 @@ class SuperPosPromptWrapper(nn.Module):
         # This way the prompt learns to steer the model toward outputting "positive"/"negative"
         # tokens, which transfers naturally to any target model's lm_head.
         # SST-2: 0=negative, 1=positive
-        self.neg_ids = (
-            self.tokenizer.encode(" negative", add_special_tokens=False)
-            + self.tokenizer.encode("negative", add_special_tokens=False)
-        )
-        self.pos_ids = (
-            self.tokenizer.encode(" positive", add_special_tokens=False)
-            + self.tokenizer.encode("positive", add_special_tokens=False)
-        )
+        self.neg_ids = get_verbalizer_ids(self.tokenizer, "negative")
+        self.pos_ids = get_verbalizer_ids(self.tokenizer, "positive")
 
     def get_prompt_embeddings(self):
         """Compute L×H prompt from L×m logits and m×H token embeddings.
@@ -267,7 +377,7 @@ class SuperPosPromptWrapper(nn.Module):
         guaranteeing prompt vectors stay inside the convex hull of basis tokens.
         """
         E = self.backbone.model.embed_tokens.weight[self.sampled_ids].float()  # [m, H] fp32
-        norm_weights = F.softmax(self.prompt_weights / SUPERPOS_TEMPERATURE, dim=-1)
+        norm_weights = F.softmax(self.prompt_weights / self.temperature, dim=-1)
         return norm_weights @ E
 
     def forward(self, input_ids, attention_mask, prompt_embeds=None):
@@ -374,14 +484,8 @@ class SuperPosReLUWrapper(nn.Module):
         self.prompt_weights = nn.Parameter(torch.rand(prompt_len, m) * 0.1 + 0.05)
 
         # LM Head classification (same as SuperPosPromptWrapper)
-        self.neg_ids = (
-            self.tokenizer.encode(" negative", add_special_tokens=False)
-            + self.tokenizer.encode("negative", add_special_tokens=False)
-        )
-        self.pos_ids = (
-            self.tokenizer.encode(" positive", add_special_tokens=False)
-            + self.tokenizer.encode("positive", add_special_tokens=False)
-        )
+        self.neg_ids = get_verbalizer_ids(self.tokenizer, "negative")
+        self.pos_ids = get_verbalizer_ids(self.tokenizer, "positive")
 
     def get_prompt_embeddings(self):
         """Compute L×H prompt from L×m weights and m×H token embeddings.
@@ -445,6 +549,11 @@ def load_superpos_relu_prompt(model_name, prompt_path, device="cuda"):
 def save_superpos_prompt(wrapper, path):
     torch.save({
         "type": "superpos_lmhead",
+        "format_version": 2,
+        "weight_mode": "softmax",
+        "temperature": float(wrapper.temperature),
+        "seed": wrapper.seed,
+        "source_model": wrapper.model_name,
         "sampled_ids": wrapper.sampled_ids.cpu(),
         "prompt_weights": wrapper.prompt_weights.data.cpu(),
         "neg_ids": list(wrapper.neg_ids),
@@ -457,12 +566,15 @@ def save_superpos_prompt(wrapper, path):
 
 def load_superpos_prompt(model_name, prompt_path, device="cuda"):
     ckpt = torch.load(prompt_path, map_location=device)
+    temperature = resolve_superpos_temperature(ckpt)
     wrapper = SuperPosPromptWrapper(
         model_name,
         prompt_len=ckpt["prompt_len"],
         num_labels=2,  # fixed for LM Head binary classification
         m=ckpt["m"],
         sampled_ids=ckpt["sampled_ids"].to(device),
+        temperature=temperature,
+        seed=ckpt.get("seed"),
     )
     wrapper.prompt_weights.data.copy_(ckpt["prompt_weights"].to(device))
     wrapper.to(device)
@@ -476,9 +588,21 @@ def transfer_superpos(src_prompt_path, tgt_model_name):
     tgt_model = AutoModelForCausalLM.from_pretrained(
         tgt_model_name, torch_dtype=torch.float16, device_map="cpu"
     )
+    source_model_name = ckpt.get("source_model")
+    if source_model_name is not None:
+        assert_sampled_ids_aligned(
+            ckpt["sampled_ids"],
+            AutoTokenizer.from_pretrained(source_model_name),
+            AutoTokenizer.from_pretrained(tgt_model_name),
+        )
+    else:
+        warnings.warn(
+            "SuperPos checkpoint has no source_model metadata; token ID alignment "
+            "cannot be verified for this legacy checkpoint.",
+            RuntimeWarning,
+        )
     tgt_emb = tgt_model.model.embed_tokens.weight[ckpt["sampled_ids"]].float()
-    weights = ckpt["prompt_weights"].float().detach()
-    norm_weights = F.softmax(weights / SUPERPOS_TEMPERATURE, dim=-1)
+    norm_weights, _ = activate_superpos_weights(ckpt)
     projected = (norm_weights @ tgt_emb).detach()
     del tgt_model
     return projected, ckpt
@@ -737,7 +861,11 @@ def evaluate_model(model, dataloader, device, prompt_embeds=None, desc="Eval"):
     return correct / total if total > 0 else 0.0
 
 
-def build_dataloader(dataset, batch_size, shuffle=True, sampler=None):
+def build_dataloader(dataset, batch_size, shuffle=True, sampler=None, seed=None):
     if sampler is not None:
         return DataLoader(dataset, batch_size=batch_size, sampler=sampler, shuffle=False)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, generator=generator)

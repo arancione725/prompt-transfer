@@ -309,7 +309,14 @@ def soft_bridge_prompt(
         sim = prompt_norm @ src_emb_sampled_norm.T                          # [L, m]
 
         # --- 2. Select top-K basis tokens by ORIGINAL weight (not cosine sim) ---
-        _, topk_idx = prompt_weights.topk(min(topk, m), dim=1)              # [L, K]
+        k = min(topk, m)
+        if k < 1:
+            raise ValueError(f"topk must be >= 1, got {topk}")
+        topk_vals, topk_idx = prompt_weights.topk(k, dim=1)                 # [L, K]
+        # Top-K is a sparse approximation of the original convex mixture.
+        # Renormalize the retained mass so changing K does not also change
+        # the prompt scale.
+        topk_weights = topk_vals / topk_vals.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
         # --- 3. Per-position cosine-similarity gate ---
         # Gate = max cosine sim between mixed vector and its selected basis tokens.
@@ -332,9 +339,9 @@ def soft_bridge_prompt(
             expected_norm = 0.0
             texts_for_pos = []
 
-            for k in range(min(topk, m)):
-                basis_idx = topk_idx[i, k].item()          # index into [0, m-1]
-                w = prompt_weights[i, basis_idx].item()    # original activated weight
+            for k_idx in range(k):
+                basis_idx = topk_idx[i, k_idx].item()       # index into [0, m-1]
+                w = topk_weights[i, k_idx].item()           # renormalized weight
                 if w <= 0:
                     continue
 

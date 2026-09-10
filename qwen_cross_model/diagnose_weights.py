@@ -9,23 +9,24 @@ Usage:
 
 import argparse
 import torch
-import torch.nn.functional as F
 from transformers import AutoTokenizer
+
+from qwen_cross_model.utils import activate_superpos_weights
 
 
 def main():
     parser = argparse.ArgumentParser(description="SuperPos weight diagnostics")
     parser.add_argument("--ckpt", default="outputs_qwen/prompt_superpos_Qwen_Qwen2.5-1.5B_sst2.pt")
-    parser.add_argument("--temp", type=float, default=0.1)
+    parser.add_argument("--temp", type=float, default=None,
+                        help="Override checkpoint temperature; default reads the checkpoint")
     parser.add_argument("--model", default="Qwen/Qwen2.5-1.5B")
     args = parser.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    logits = ckpt["prompt_weights"].float()  # [L, m]
+    prob, temperature = activate_superpos_weights(ckpt, temperature=args.temp)
+    args.temp = temperature
     ids = ckpt["sampled_ids"]                 # [m]
-    L, m = logits.shape
-
-    prob = F.softmax(logits / args.temp, dim=-1)
+    L, m = prob.shape
 
     tok = AutoTokenizer.from_pretrained(args.model)
 
@@ -34,13 +35,13 @@ def main():
     top1_val = top1_val.squeeze(-1)
     top1_idx = top1_idx.squeeze(-1)
 
-    top3_val, top3_idx = prob.topk(3, dim=-1)
+    top3_val, top3_idx = prob.topk(min(3, m), dim=-1)
     top3_sum = top3_val.sum(-1)
 
-    entropy = -(prob * prob.log().clamp_min(1e-12)).sum(-1)
+    entropy = -(prob * prob.clamp_min(1e-12).log()).sum(-1)
 
     print(f"Checkpoint: {args.ckpt}")
-    print(f"Temperature: {args.temp}")
+    print(f"Temperature: {temperature}")
     print(f"Shape: [{L}, {m}]  (prompt_len={L}, basis={m})")
     print()
 
@@ -75,16 +76,16 @@ def main():
     print(f"Verdict")
     print(f"{'='*60}")
     if entropy.mean() < 0.5:
-        print(f"[!] T={args.temp} too SMALL — weights collapsed to one-hot")
-        print(f"    > Try T={args.temp * 3:.1f}~{args.temp * 5:.1f}")
+        print(f"[!] T={temperature} too SMALL — weights collapsed to one-hot")
+        print(f"    > Try T={temperature * 3:.1f}~{temperature * 5:.1f}")
     elif entropy.mean() > 4.5:
-        print(f"[!] T={args.temp} too LARGE — weights nearly uniform")
-        print(f"    > Try T={args.temp * 0.3:.1f}~{args.temp * 0.5:.1f}")
+        print(f"[!] T={temperature} too LARGE — weights nearly uniform")
+        print(f"    > Try T={temperature * 0.3:.1f}~{temperature * 0.5:.1f}")
     elif 1.5 <= entropy.mean() <= 3.5 and dead < 10 and dense < 80:
-        print(f"[*] Weights look HEALTHY at T={args.temp}")
+        print(f"[*] Weights look HEALTHY at T={temperature}")
         print(f"    > Proceed to bridge eval")
     else:
-        print(f"[~] Weights at T={args.temp} are borderline")
+        print(f"[~] Weights at T={temperature} are borderline")
         top1_avg = top1_val.float().mean().item()
         if top1_avg > 0.7:
             print(f"    > Slightly too sparse (top1 mean={top1_avg:.3f}), consider raising T")

@@ -11,6 +11,7 @@ PROMPT_LEN = 100
 PROMPT_INIT_TOKEN = "<|endoftext|>"  # fallback init token
 SUPERPOS_M = 128  # number of sampled token embeddings per SuperPos prompt position
 SUPERPOS_TEMPERATURE = 0.5  # softmax temperature for convex-combination enforcement
+DEFAULT_SEED = 42
 PROMPT_INIT_TEXT = {
     "sst2": "Classify the sentiment of this movie review. Determine whether it is positive or negative. Analyze the tone and emotion expressed in the text. The overall feeling conveyed is",
     # Add more datasets here

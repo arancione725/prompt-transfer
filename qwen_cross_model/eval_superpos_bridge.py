@@ -20,8 +20,15 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from .config import SUPERPOS_TEMPERATURE
-from .utils import load_dataset_by_name, build_dataloader
+from .config import DEFAULT_SEED
+from .utils import (
+    load_dataset_by_name,
+    build_dataloader,
+    activate_superpos_weights,
+    assert_sampled_ids_aligned,
+    get_verbalizer_ids,
+    set_seed,
+)
 
 SRC_PROMPT = "outputs_qwen/superpos/prompt_superpos_Qwen_Qwen2.5-1.5B_sst2.pt"
 TGT_MODEL = "Qwen/Qwen2.5-7B"
@@ -33,7 +40,7 @@ parser.add_argument("--src-prompt", default=SRC_PROMPT)
 parser.add_argument("--src-model", default=SRC_MODEL)
 parser.add_argument("--tgt-model", default=TGT_MODEL)
 parser.add_argument("--bridge-mode", default="soft", choices=["direct", "soft"],
-                    help="direct=top-K weight lookup; soft=full bridge pipeline")
+                    help="direct=pure target lookup; soft=basis-constrained bridge")
 parser.add_argument("--device", default="cuda:0")
 parser.add_argument("--bridge-topk", type=int, default=5,
                     help="TopK for soft bridge vocab search")
@@ -41,11 +48,13 @@ parser.add_argument("--bridge-temp", type=float, default=0.05)
 parser.add_argument("--direct-temp", type=float, default=1.0,
                     help="Temperature for direct bridge weight scaling (lower=sharper)")
 parser.add_argument("--direct-norm", action="store_true", default=False,
-                    help="Enable norm calibration for direct bridge")
+                    help="Deprecated compatibility flag; direct bridge is always pure")
 parser.add_argument("--batch-size", type=int, default=8)
 parser.add_argument("--pos-word", default="positive")
 parser.add_argument("--neg-word", default="negative")
+parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
 args = parser.parse_args()
+set_seed(args.seed)
 
 print(f"SuperPos + Bridge (LM Head)  bridge_mode={args.bridge_mode}")
 print(f"Source prompt: {args.src_prompt}")
@@ -57,11 +66,11 @@ print(f"Target model:  {args.tgt_model}")
 print("\n[1/5] Loading SuperPos checkpoint...")
 ckpt = torch.load(args.src_prompt, map_location="cpu")
 sampled_ids = ckpt["sampled_ids"]          # [128]
-raw_weights = ckpt["prompt_weights"].float()   # [100, 128]
-
-# Convert raw logits to probability weights (matches training-time softmax)
-weights = F.softmax(raw_weights / SUPERPOS_TEMPERATURE, dim=-1)
+# Convert raw logits with the temperature recorded at training time.
+weights, temperature = activate_superpos_weights(ckpt)
+sampled_ids = sampled_ids.long()
 print(f"  Weights: {weights.shape}")
+print(f"  Checkpoint temperature: {temperature}")
 
 # =========================================================================
 # 2. Compute source prompt embeddings (lightweight — embedding only)
@@ -92,14 +101,11 @@ tokenizer = AutoTokenizer.from_pretrained(args.tgt_model)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "left"
+src_tokenizer = AutoTokenizer.from_pretrained(args.src_model)
+assert_sampled_ids_aligned(sampled_ids, src_tokenizer, tokenizer)
 
-pos_ids = set()
-neg_ids = set()
-for prefix in ["", " "]:
-    pos_ids.update(tokenizer.encode(prefix + args.pos_word, add_special_tokens=False))
-    neg_ids.update(tokenizer.encode(prefix + args.neg_word, add_special_tokens=False))
-pos_ids = sorted(pos_ids)
-neg_ids = sorted(neg_ids)
+pos_ids = get_verbalizer_ids(tokenizer, args.pos_word)
+neg_ids = get_verbalizer_ids(tokenizer, args.neg_word)
 print(f"  Positive tokens: {pos_ids}  -> {[tokenizer.decode([i]) for i in pos_ids]}")
 print(f"  Negative tokens: {neg_ids}  -> {[tokenizer.decode([i]) for i in neg_ids]}")
 
@@ -153,7 +159,6 @@ def evaluate_with_lm_head(projected_prompt, desc="Eval"):
 # =====================================================================
 if args.bridge_mode == "direct":
     tgt_emb = tgt_model.model.embed_tokens.weight[sampled_ids].float().cpu()  # [128, d_tgt]
-    target_norm = tgt_emb.norm(p=2, dim=-1).mean()
 
     print("[5/5] Direct bridge K sweep...")
     k_list = [1, 3, 5, 6, 7, 8, 10, 20, 50, 128]
@@ -168,19 +173,11 @@ if args.bridge_mode == "direct":
         projected = torch.zeros(100, tgt_emb.size(1))
         for i in range(100):
             pos_vec = (topk_w[i].unsqueeze(1) * tgt_emb[topk_idx[i]]).sum(dim=0)
-            if args.direct_norm:
-                expected_norm = (topk_w[i] * tgt_emb[topk_idx[i]].norm(p=2, dim=-1)).sum()
-                actual_norm = pos_vec.norm(p=2, dim=-1).clamp_min(1e-8)
-                pos_vec = pos_vec / actual_norm * expected_norm
             projected[i] = pos_vec
-
-        if not args.direct_norm:
-            prompt_norm_val = projected.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
-            projected = projected / prompt_norm_val * target_norm
 
         acc = evaluate_with_lm_head(projected, desc=f"Direct K={k}")
         proj_norm = projected.norm(p=2, dim=-1).mean().item()
-        print(f"SuperPos-direct K={k}: {acc:.4f}  (proj_norm={proj_norm:.4f}, target_norm={target_norm:.4f})")
+        print(f"SuperPos-direct K={k}: {acc:.4f}  (proj_norm={proj_norm:.4f})")
 
 
 # =====================================================================
@@ -200,6 +197,10 @@ else:
             local_norm=True,
             use_direct_id=True,
             mask_sink_tokens=True,
+            sampled_ids=sampled_ids,
+            prompt_weights=weights,
+            weight_mode="softmax",
+            weight_temperature=temperature,
         )
 
         acc = evaluate_with_lm_head(projected, desc=f"Soft K={k}")

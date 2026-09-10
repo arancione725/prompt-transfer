@@ -30,8 +30,15 @@ _PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
-from qwen_cross_model.config import SUPERPOS_TEMPERATURE, OUTPUT_DIR, PROMPT_LEN
-from qwen_cross_model.utils import load_dataset_by_name, build_dataloader, format_time
+from qwen_cross_model.config import SUPERPOS_TEMPERATURE, OUTPUT_DIR, PROMPT_LEN, DEFAULT_SEED
+from qwen_cross_model.utils import (
+    load_dataset_by_name,
+    build_dataloader,
+    format_time,
+    activate_superpos_weights,
+    set_seed,
+    get_verbalizer_ids,
+)
 from qwen_cross_model.align import get_embedding_matrix
 
 
@@ -177,7 +184,10 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--pos-word", default="positive")
     parser.add_argument("--neg-word", default="negative")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     # ---- DDP setup ----
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -216,12 +226,12 @@ def main():
         print("--- [1/5] Loading SuperPos checkpoint ---")
     ckpt = torch.load(args.src_prompt, map_location="cpu")
     sampled_ids = ckpt["sampled_ids"]
-    logits = ckpt["prompt_weights"].float()
-
     if args.weight_mode == "softmax":
-        weights = F.softmax(logits / SUPERPOS_TEMPERATURE, dim=-1)
+        weights, temperature = activate_superpos_weights(ckpt)
     else:
+        logits = ckpt["prompt_weights"].float()
         weights = F.relu(logits)
+        temperature = None
 
     src_emb_full, src_hidden = get_embedding_matrix(args.src_model)
     src_emb_sampled = src_emb_full[sampled_ids].float()
@@ -229,6 +239,8 @@ def main():
 
     if is_main:
         print(f"  Weights:      {weights.shape}")
+        if temperature is not None:
+            print(f"  Temperature:  {temperature}")
         print(f"  src_prompt:   shape={src_prompt_emb.shape}  "
               f"norm={src_prompt_emb.norm(p=2, dim=-1).mean():.4f}")
 
@@ -257,11 +269,8 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    pos_ids = set()
-    neg_ids = set()
-    for prefix in ["", " "]:
-        pos_ids.update(tokenizer.encode(prefix + args.pos_word, add_special_tokens=False))
-        neg_ids.update(tokenizer.encode(prefix + args.neg_word, add_special_tokens=False))
+    pos_ids = set(get_verbalizer_ids(tokenizer, args.pos_word))
+    neg_ids = set(get_verbalizer_ids(tokenizer, args.neg_word))
     if is_main:
         print(f"  pos_ids: {sorted(pos_ids)}  → {[tokenizer.decode([i]) for i in sorted(pos_ids)]}")
         print(f"  neg_ids: {sorted(neg_ids)}  → {[tokenizer.decode([i]) for i in sorted(neg_ids)]}")
@@ -294,7 +303,7 @@ def main():
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=local_rank, shuffle=True)
         train_loader = build_dataloader(train_ds, args.batch_size, shuffle=False, sampler=train_sampler)
     else:
-        train_loader = build_dataloader(train_ds, args.batch_size, shuffle=True)
+        train_loader = build_dataloader(train_ds, args.batch_size, shuffle=True, seed=args.seed)
     eval_loader = build_dataloader(eval_ds, args.batch_size * 2, shuffle=False)
     train_eval_subset = torch.utils.data.Subset(train_ds, range(min(1000, len(train_ds))))
     train_eval_loader = build_dataloader(train_eval_subset, args.batch_size * 2, shuffle=False)

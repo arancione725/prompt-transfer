@@ -19,12 +19,18 @@ if _PARENT not in sys.path:
 
 import argparse
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from qwen_cross_model.config import SUPERPOS_TEMPERATURE
-from qwen_cross_model.utils import load_dataset_by_name, build_dataloader
+from qwen_cross_model.config import DEFAULT_SEED
+from qwen_cross_model.utils import (
+    load_dataset_by_name,
+    build_dataloader,
+    activate_superpos_weights,
+    assert_sampled_ids_aligned,
+    get_verbalizer_ids,
+    set_seed,
+)
 from qwen_cross_model.align import get_embedding_matrix
 from qwen_cross_model.discrete_bridge import soft_bridge_prompt
 
@@ -41,11 +47,13 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--pos-word", default="positive", help="Word used for positive class")
     parser.add_argument("--neg-word", default="negative", help="Word used for negative class")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--no-local-norm", action="store_true",
                         help="Disable local norm calibration")
     parser.add_argument("--no-direct-id", action="store_true",
                         help="Disable direct ID mapping (use decode→encode)")
     args = parser.parse_args()
+    set_seed(args.seed)
 
     print(f"SuperPos + Soft Bridge + LM Head Evaluation")
     print(f"Source prompt:   {args.src_prompt}")
@@ -60,10 +68,16 @@ def main():
     print("\n[1/5] Loading SuperPos checkpoint...")
     ckpt = torch.load(args.src_prompt, map_location="cpu")
     sampled_ids = ckpt["sampled_ids"]              # [128]
-    logits = ckpt["prompt_weights"].float()        # [100, 128]
+    prob, temperature = activate_superpos_weights(ckpt)
+    sampled_ids = sampled_ids.long()
+    if not 1 <= args.bridge_topk <= prob.size(1):
+        raise ValueError(f"--bridge-topk must be in [1, {prob.size(1)}], got {args.bridge_topk}")
+    print(f"  Checkpoint temperature: {temperature}")
 
-    # Activate weights (same activation used during training)
-    prob = F.softmax(logits / SUPERPOS_TEMPERATURE, dim=-1)  # [100, 128]
+    if not args.no_direct_id:
+        src_tokenizer = AutoTokenizer.from_pretrained(args.src_model)
+        tgt_tokenizer = AutoTokenizer.from_pretrained(args.tgt_model)
+        assert_sampled_ids_aligned(sampled_ids, src_tokenizer, tgt_tokenizer)
 
     # Weight sparsity stats
     total_w = prob.numel()
@@ -87,7 +101,7 @@ def main():
         sampled_ids=sampled_ids,
         prompt_weights=prob,
         weight_mode="softmax",
-        weight_temperature=SUPERPOS_TEMPERATURE,
+        weight_temperature=temperature,
     )
 
     print(f"  Mode:             {diag['mode']}")
@@ -112,13 +126,8 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    pos_ids = set()
-    neg_ids = set()
-    for prefix in ["", " "]:
-        pos_ids.update(tokenizer.encode(prefix + args.pos_word, add_special_tokens=False))
-        neg_ids.update(tokenizer.encode(prefix + args.neg_word, add_special_tokens=False))
-    pos_ids = sorted(pos_ids)
-    neg_ids = sorted(neg_ids)
+    pos_ids = get_verbalizer_ids(tokenizer, args.pos_word)
+    neg_ids = get_verbalizer_ids(tokenizer, args.neg_word)
     print(f"  Positive tokens: {pos_ids}  → {[tokenizer.decode([i]) for i in pos_ids]}")
     print(f"  Negative tokens: {neg_ids}  → {[tokenizer.decode([i]) for i in neg_ids]}")
 
