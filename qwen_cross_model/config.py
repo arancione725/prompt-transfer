@@ -17,6 +17,32 @@ PROMPT_INIT_TEXT = {
     # Add more datasets here
 }
 
+SST2_SENTIMENT_SEEDS = [
+    "positive", "negative", "good", "bad", "great", "terrible",
+    "excellent", "awful", "wonderful", "horrible", "love", "hate",
+    "liked", "disliked", "amazing", "boring", "fantastic", "poor",
+    "best", "worst", "happy", "sad", "enjoy", "disappointed",
+    "beautiful", "ugly", "fun", "dull", "brilliant",
+    "nice", "nasty", "superb", "dreadful", "delightful", "miserable",
+    "impressive", "pathetic", "lovely", "disgusting", "incredible",
+    "lousy", "outstanding", "disappointing", "magnificent",
+    "enjoyable", "tedious", "fabulous", "rotten", "splendid", "appalling",
+    "charming", "vile", "pleasing", "atrocious", "awesome", "lame",
+    "cool", "decent", "fine", "warm", "cold",
+    "masterpiece", "garbage", "trash",
+    "recommend", "avoid", "worth", "waste",
+    # SST-2 label words
+    "Positive", "Negative",
+    "sentiment", "review", "movie", "film",
+    # Common review modifiers
+    "not", "very", "really", "so", "too", "quite", "pretty",
+    "one", "of", "the", "most", "least", "ever", "never",
+    "always", "sometimes", "rarely",
+    # Punctuation / emphasis carriers
+    "!", "?", "...",
+]
+
+
 # --- Dataset ---
 DATASET = "sst2"
 NUM_LABELS = 2

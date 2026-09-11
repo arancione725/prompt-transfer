@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from .config import (
     MAX_SEQ_LENGTH, NUM_LABELS, PROMPT_LEN,
-    PROMPT_INIT_TOKEN, SUPERPOS_TEMPERATURE,
+    PROMPT_INIT_TOKEN, SUPERPOS_TEMPERATURE, SST2_SENTIMENT_SEEDS,
 )
 
 
@@ -328,11 +328,7 @@ class SuperPosPromptWrapper(nn.Module):
 
             # Inject SST-2 sentiment seed words into the basis so prompt vectors
             # are anchored on the sentiment manifold from the start
-            try:
-                from .discrete_bridge import SST2_SENTIMENT_SEEDS
-                seed_words = SST2_SENTIMENT_SEEDS
-            except ImportError:
-                seed_words = ["positive", "negative", "good", "bad", "great", "terrible"]
+            seed_words = SST2_SENTIMENT_SEEDS
 
             seed_ids_set = set()
             for word in seed_words:
@@ -450,11 +446,7 @@ class SuperPosReLUWrapper(nn.Module):
         else:
             vocab_size = self.backbone.model.embed_tokens.weight.size(0)
 
-            try:
-                from .discrete_bridge import SST2_SENTIMENT_SEEDS
-                seed_words = SST2_SENTIMENT_SEEDS
-            except ImportError:
-                seed_words = ["positive", "negative", "good", "bad", "great", "terrible"]
+            seed_words = SST2_SENTIMENT_SEEDS
 
             seed_ids_set = set()
             for word in seed_words:

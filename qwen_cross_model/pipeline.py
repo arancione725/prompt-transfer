@@ -2,7 +2,7 @@
 """Main entry point for Qwen cross-model prompt transfer pipeline.
 
 Usage:
-    python -m qwen_cross_model.train_projector --src Qwen/Qwen2.5-1.5B --tgt Qwen/Qwen2.5-7B --dataset sst2
+    python -m qwen_cross_model.pipeline --src Qwen/Qwen2.5-1.5B --tgt Qwen/Qwen2.5-7B --dataset sst2
 
 Steps:
     1. Train soft prompt on source model
@@ -29,7 +29,7 @@ from qwen_cross_model.config import (
     PROJECTOR_LR, PROJECTOR_EPOCHS, PROJECTOR_BATCH_SIZE,
     OUTPUT_DIR, DEFAULT_SEED,
 )
-from qwen_cross_model.prompt_tuner import train_prompt, train_superpos_prompt
+from qwen_cross_model.superpos_trainer import train_prompt, train_superpos_prompt
 from qwen_cross_model.projector import train_projector
 from qwen_cross_model.utils import (
     load_prompt, evaluate_model, build_dataloader, load_dataset_by_name,
@@ -37,9 +37,6 @@ from qwen_cross_model.utils import (
     save_superpos_prompt, load_superpos_prompt, transfer_superpos,
     set_seed,
 )
-from qwen_cross_model.eval import quick_compare
-
-
 def main():
     parser = argparse.ArgumentParser(description="Qwen Cross-Model Prompt Transfer")
     parser.add_argument("--src", type=str, default=MODEL_1_5B, help="Source model name")
@@ -139,10 +136,10 @@ def main():
         projected, ckpt = transfer_superpos(src_prompt_path, args.tgt)
         print(f"  Projected prompt: {projected.shape}")
 
-        # LM Head mode: no classification head to project — use eval_superpos_lmhead.py
+        # LM Head mode: no classification head to project; use the dedicated eval entrypoints.
         if "classification_head" not in ckpt:
             print(f"\n  LM Head checkpoint detected — no classification head to project.")
-            print(f"  Use eval_superpos_lmhead.py for evaluation.")
+            print(f"  Use qwen_cross_model.eval_direct or qwen_cross_model.eval_soft_bridge for evaluation.")
             return
 
         # Build target wrapper + project head

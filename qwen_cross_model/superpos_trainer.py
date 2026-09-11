@@ -1,4 +1,4 @@
-"""Train a soft prompt on a Qwen model. Supports DDP multi-GPU via torchrun."""
+"""Train source prompts, including the SuperPos prompt variant, with DDP support."""
 
 import os
 import time
